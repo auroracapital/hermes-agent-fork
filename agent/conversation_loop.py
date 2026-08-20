@@ -7988,7 +7988,9 @@ def run_conversation(
                         verify_on_stop_enabled,
                     )
 
-                    if verify_on_stop_enabled():
+                    if verify_on_stop_enabled(
+                        platform=getattr(agent, "platform", "") or ""
+                    ):
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),

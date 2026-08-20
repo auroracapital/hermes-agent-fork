@@ -92,8 +92,49 @@ def _session_is_messaging_surface() -> bool:
         return False
 
 
-def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
+# Surfaces where the turn's ``final_response`` IS the delivered artifact and
+# nothing further is read by a human in-session. Verify-on-stop works by
+# discarding the model's attempted answer into an interim message, running one
+# or more extra internal turns, and letting the LAST of those turns become the
+# turn's ``final_response``. On an interactive surface that is fine (the user
+# sees both the interim answer and the verification narrative). On an
+# unattended scheduled run it is a silent corruption: cron delivers
+# ``result["final_response"]`` verbatim, so the job's real report is persisted
+# only as an interim message and the verification turn's closing sentence is
+# delivered to the user as if it were the job's findings.
+_UNATTENDED_FINAL_RESPONSE_SURFACES = frozenset({"cron"})
+
+
+def _session_is_unattended_scheduled_run(platform: str | None = None) -> bool:
+    """Whether this turn is an unattended scheduled run (cron).
+
+    ``platform`` is the authoritative signal: ``cron.scheduler.run_job`` builds
+    its AIAgent with ``platform="cron"``. The env fallbacks are a secondary net
+    for callers that do not thread the agent through.
+    """
+    candidates = [platform or "", os.environ.get("HERMES_PLATFORM") or ""]
+    try:
+        from gateway.session_context import get_session_env
+
+        candidates.append(get_session_env("HERMES_SESSION_PLATFORM", "") or "")
+        candidates.append(get_session_env("HERMES_SESSION_SOURCE", "") or "")
+    except Exception:
+        candidates.append(os.environ.get("HERMES_SESSION_PLATFORM", "") or "")
+        candidates.append(os.environ.get("HERMES_SESSION_SOURCE", "") or "")
+    return any(
+        str(c).strip().lower() in _UNATTENDED_FINAL_RESPONSE_SURFACES for c in candidates
+    )
+
+
+def verify_on_stop_enabled(
+    config: dict[str, Any] | None = None, *, platform: str | None = None
+) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
+
+    An unattended scheduled run (``platform="cron"``) is always OFF, checked
+    BEFORE the env/config switches. An explicit ``agent.verify_on_stop: true``
+    is consent for the user's own coding sessions, not consent for a scheduled
+    job to replace its report with the verification turn's closing sentence.
 
     Precedence: an explicit ``HERMES_VERIFY_ON_STOP`` env var wins, then an
     explicit ``agent.verify_on_stop`` config value. The default is ``False``
@@ -106,6 +147,8 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     verification narrative would reach a human as chat noise. A missing or
     unrecognized value falls back to OFF.
     """
+    if _session_is_unattended_scheduled_run(platform):
+        return False
     env = os.environ.get("HERMES_VERIFY_ON_STOP")
     if env is not None:
         return env.strip().lower() not in {"0", "false", "no", "off"}
