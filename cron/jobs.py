@@ -590,7 +590,7 @@ def effective_job_state(job: Dict[str, Any]) -> str:
     Terminal states (completed/error) are preserved regardless of enabled.
     """
     stored = _coerce_job_text(job.get("state")).strip()
-    if stored in {"completed", "error"}:
+    if stored in {"completed", "error", WEDGED_ONESHOT_STATE}:
         return stored
     if not job.get("enabled", True):
         if _has_pause_marker(job) or stored == "paused":
@@ -2545,48 +2545,141 @@ def _mark_job_run_locked(
         return False
 
 
+#: Terminal state for a one-shot whose dispatch was claimed but whose run
+#: never completed. The record is RETAINED in this state (never deleted) so
+#: the job stays inspectable in ``cronjob list`` and the user can see exactly
+#: what was lost. ``enabled`` is forced False, so it can never re-fire.
+WEDGED_ONESHOT_STATE = "interrupted"
+
+
+def _describe_job_schedule(job: Dict[str, Any]) -> str:
+    """Human-readable one-liner for a job's schedule (for loud reports)."""
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict):
+        return str(schedule)
+    kind = schedule.get("kind")
+    if kind == "once":
+        return f"once at {schedule.get('run_at', '?')}"
+    if kind == "cron":
+        return f"cron {schedule.get('expr', '?')}"
+    if kind == "interval":
+        return f"every {schedule.get('minutes', '?')} minutes"
+    return json.dumps(schedule, default=str)
+
+
+def _disarm_wedged_oneshot(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Retire an interrupted one-shot IN PLACE instead of deleting it.
+
+    Mutates the record so it can never fire again (``enabled`` False, no
+    ``next_run_at``, claim cleared) while keeping it visible in the store.
+    Returns a pre-mutation snapshot so reporting retains the original claim.
+    """
+    report_job = copy.deepcopy(job)
+    job["enabled"] = False
+    job["state"] = WEDGED_ONESHOT_STATE
+    job["next_run_at"] = None
+    job["run_claim"] = None
+    job["interrupted_at"] = _hermes_now().isoformat()
+    if not job.get("last_error"):
+        job["last_error"] = (
+            "Interrupted mid-run: the dispatch was claimed but the run never "
+            "completed. Retained (disabled) for inspection or explicit rerun."
+        )
+    return report_job
+
+
+def _wedged_oneshot_report(job: Dict[str, Any]) -> str:
+    """Compose the operator-facing report for an interrupted one-shot."""
+    repeat = job.get("repeat") or {}
+    claim = job.get("run_claim") or {}
+    return (
+        "# ⚠️ Cron one-shot INTERRUPTED — it did NOT run\n\n"
+        f"- job id: {job.get('id')}\n"
+        f"- name: {job.get('name')}\n"
+        f"- schedule: {_describe_job_schedule(job)}\n"
+        f"- dispatch claimed: {repeat.get('completed', '?')}/{repeat.get('times', '?')}\n"
+        f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
+        f"- detected at: {_hermes_now().isoformat()}\n\n"
+        "This one-shot job's dispatch was claimed, but the run never "
+        "completed (`last_run_at` was never written) — the scheduler "
+        "process was most likely killed or restarted mid-execution.\n\n"
+        "**The job has NOT been deleted.** It is retained in state "
+        f"`{WEDGED_ONESHOT_STATE}` and disabled so it cannot re-fire on its "
+        "own. Its prompt and schedule are still in `cron/jobs.json`. If the "
+        "task still matters, run it explicitly (`hermes cron run <id>`) or "
+        "recreate it with a new future schedule; if not, delete it explicitly.\n"
+    )
+
+
+def _deliver_wedged_oneshot_report(job: Dict[str, Any], text: str) -> None:
+    """Push the interrupted-one-shot report to the job's origin channel.
+
+    Best-effort and lazily imported (``cron.scheduler`` imports this module,
+    so a module-level import would be circular). A one-shot that was created
+    from chat carries an ``origin``; jobs whose ``deliver`` is ``local`` are
+    escalated to ``origin`` here on purpose — losing a scheduled job is
+    exactly the class of event that must never stay silent, and the origin
+    resolver already falls back to the configured home channel.
+    """
+    try:
+        from cron.scheduler import _deliver_result
+
+        report_job = dict(job)
+        if str(report_job.get("deliver", "local")).strip().lower() in ("", "local"):
+            report_job["deliver"] = "origin"
+        err = _deliver_result(report_job, text)
+        if err:
+            logger.error(
+                "Job '%s': interrupted one-shot report could NOT be delivered "
+                "(%s) — see the job's output directory",
+                job.get("name", job.get("id", "?")),
+                err,
+            )
+    except Exception as e:
+        logger.error(
+            "Job '%s': failed to deliver interrupted one-shot report: %s",
+            job.get("name", job.get("id", "?")),
+            e,
+        )
+
+
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
-    """Leave an operator-visible trace when a wedged one-shot is removed.
+    """Loudly report an interrupted one-shot. Never deletes, never silent.
 
     A finite one-shot whose dispatch was claimed (``repeat.completed`` >=
     ``repeat.times``) but which never reached ``mark_job_run`` (``last_run_at``
     is null) was interrupted mid-run — scheduler restart, gateway kill, or a
-    non-Exception escape (#73973). The recovery guards remove such jobs so
-    they stop appearing due, but a silent removal leaves the user with no
-    output, no error, and no job record. Write a small diagnostic file into
-    the job's output directory so the removal is observable and debuggable.
+    non-Exception escape (#73973).
 
-    Best-effort: diagnostics must never break the removal itself.
+    Previously the recovery guards DELETED such jobs and wrote only a file
+    into the job's output directory — which nobody reads. A real financial
+    deadline (job f98f9fcf2561) was lost that way on 2026-08-20. The record is
+    now retained and disabled by ``_disarm_wedged_oneshot`` and this helper
+    both writes the diagnostic AND delivers it to the job's origin channel,
+    naming the job id, name and schedule.
+
+    Best-effort: reporting must never break the caller's recovery path.
     """
     if job.get("last_run_at") is not None:
         return  # a prior run was recorded — normal completion race, not a wedge
+    text = ""
     try:
-        repeat = job.get("repeat") or {}
-        claim = job.get("run_claim") or {}
-        text = (
-            "# Cron job removed without producing output\n\n"
-            f"- job id: {job.get('id')}\n"
-            f"- name: {job.get('name')}\n"
-            f"- dispatch claimed: {repeat.get('completed', '?')}/{repeat.get('times', '?')}\n"
-            f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
-            f"- removed at: {_hermes_now().isoformat()}\n\n"
-            "This one-shot job's dispatch was claimed, but the run never "
-            "completed (`last_run_at` was never written) — the scheduler "
-            "process was most likely killed or restarted mid-execution. The "
-            "job has been removed to stop it re-firing; recreate it to run "
-            "again.\n"
-        )
+        text = _wedged_oneshot_report(job)
         save_job_output(job.get("id", ""), text)
         logger.warning(
-            "Job '%s': removed without a completed run — diagnostic written to "
-            "its output directory",
+            "Job '%s' (%s): one-shot INTERRUPTED mid-run — retained disabled "
+            "in state %r, NOT deleted; schedule was %s",
             job.get("name", job.get("id", "?")),
+            job.get("id", "?"),
+            WEDGED_ONESHOT_STATE,
+            _describe_job_schedule(job),
         )
     except Exception as e:
-        logger.debug(
-            "Failed to write wedged-oneshot diagnostic for job %r: %s",
+        logger.error(
+            "Failed to write interrupted-oneshot diagnostic for job %r: %s",
             job.get("id"), e,
         )
+    _deliver_wedged_oneshot_report(job, text or _wedged_oneshot_report(job))
 
 
 def claim_dispatch(job_id: str) -> bool:
@@ -2600,7 +2693,8 @@ def claim_dispatch(job_id: str) -> bool:
     instead of infinitely (issue #38758).
 
     Returns ``True`` if the caller may proceed to run the job, ``False`` if the
-    dispatch limit is already reached (in which case the stale job is removed).
+    dispatch limit is already reached. Interrupted one-shots are retained in a
+    disabled terminal state and reported instead of being silently removed.
 
     Only claims jobs with ``schedule.kind == "once"`` and ``repeat.times > 0``.
     Recurring jobs (they use ``advance_next_run``) and infinite-repeat / no-repeat
@@ -2639,14 +2733,17 @@ def claim_dispatch(job_id: str) -> bool:
                     )
                     return False
                 # A prior tick claimed the dispatch then died before the run
-                # completed (#73973) — a genuinely wedged claim. Remove it so
-                # it stops appearing as due, and leave an operator-visible
-                # diagnostic instead of vanishing silently.
-                jobs.pop(i)
-                save_jobs(jobs, removed_ids={job_id})
-                _write_wedged_oneshot_diagnostic(job)
-                logger.info(
-                    "Job '%s': dispatch limit reached (%d/%d) — removing",
+                # completed (#73973) — a genuinely wedged claim. Do NOT delete
+                # it: a silently-vanished one-shot cost Sam a real financial
+                # deadline (f98f9fcf2561, 2026-08-20). Retain the record in a
+                # disabled `interrupted` state so it stops appearing as due but
+                # stays inspectable/re-armable, and report it loudly.
+                report_job = _disarm_wedged_oneshot(job)
+                save_jobs(jobs)
+                _write_wedged_oneshot_diagnostic(report_job)
+                logger.warning(
+                    "Job '%s': dispatch limit reached (%d/%d) with no completed "
+                    "run — retained disabled as INTERRUPTED (not deleted)",
                     job.get("name", job.get("id", "?")),
                     completed,
                     times,
@@ -3411,23 +3508,27 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                     times,
                                 )
                                 continue
-                            logger.info(
-                                "Job '%s': one-shot dispatch limit reached (%d/%d) "
-                                "— removing stale due entry",
+                            logger.warning(
+                                "Job '%s': one-shot dispatch limit reached "
+                                "(%d/%d) with no completed run — retaining "
+                                "disabled as INTERRUPTED (not deleting)",
                                 job.get("name", job.get("id", "?")),
                                 completed,
                                 times,
                             )
+                            # Do NOT delete the record (#73973 follow-up): a
+                            # silent removal lost a real financial deadline
+                            # (f98f9fcf2561, 2026-08-20). Disarm it in place so
+                            # it stops being due while staying inspectable and
+                            # re-armable, then report it loudly to the origin.
                             for rj in raw_jobs:
                                 if rj["id"] == job["id"]:
-                                    raw_jobs.remove(rj)
-                                    intentionally_removed.add(str(rj["id"]))
+                                    _disarm_wedged_oneshot(rj)
                                     needs_save = True
                                     break
                             # The claimed run never completed here by
                             # definition (last_run_at unwritten is what made
-                            # the entry look due) — leave an operator-visible
-                            # diagnostic instead of vanishing silently (#73973).
+                            # the entry look due).
                             _write_wedged_oneshot_diagnostic(job)
                             continue
 
