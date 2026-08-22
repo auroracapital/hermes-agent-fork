@@ -1078,6 +1078,139 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_stranded_in_review(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Flag a task parked in ``review`` that no reviewer ever claims.
+
+    The review lane has exactly the failure mode ``_rule_stranded_in_ready``
+    covers for the ready lane, and until this rule existed it was silent.
+    ``request_review(reviewer=...)`` accepts ANY string: the value is
+    normalized and written straight onto ``tasks.assignee`` with no check
+    that it names a real profile. The review dispatch loop then calls
+    ``profile_exists`` and buckets the row into ``skipped_nonspawnable``,
+    which is deliberately quiet so human-pulled control-plane lanes don't
+    spam the operator. Net effect: a plausible-but-wrong reviewer name
+    parks finished work in ``review`` forever with no signal anywhere.
+
+    Observed live 2026-08-22 (card t_1165020d): two healify cards sat in
+    ``review`` for ~4h on assignee ``reviewer``, which is not a Hermes
+    profile on this install (the real grader profile is ``verifier``).
+    ``has_spawnable_review`` returned False the entire time, so even the
+    dispatcher's own review-lane reservation never engaged.
+
+    Age-based and identity-agnostic for the same reason as the ready rule:
+    it catches a typo, a deleted profile, a down external reviewer pool,
+    and a misconfigured dispatcher without curating a registry. A task
+    under a live claim is excluded (a reviewer is actually working it).
+    """
+    threshold_seconds = float(
+        cfg.get("stranded_review_threshold_seconds",
+                cfg.get("stranded_threshold_seconds", 30 * 60))
+    )
+    if _task_field(task, "status") != "review":
+        return []
+    # A live claim means a reviewer really is on it.
+    if _task_field(task, "claim_lock"):
+        return []
+    assignee = (_task_field(task, "assignee") or "").strip()
+
+    # Anchor on the most recent transition INTO review. ``changes_requested``
+    # is not included: that moves the card out of review, back to the
+    # implementer, so it can never be the start of a review wait.
+    last_review_ts = 0
+    for ev in events:
+        if _event_kind(ev) == "review_requested":
+            last_review_ts = max(last_review_ts, _event_ts(ev))
+    if last_review_ts == 0:
+        last_review_ts = int(_task_field(task, "created_at", default=0) or 0)
+    if last_review_ts == 0:
+        return []
+
+    age_seconds = now - last_review_ts
+    if age_seconds < threshold_seconds:
+        return []
+
+    if age_seconds >= 3600:
+        age_str = f"{age_seconds / 3600:.1f}h"
+    else:
+        age_str = f"{int(age_seconds / 60)}m"
+
+    # An unroutable assignee is a strictly worse condition than a slow
+    # reviewer: no amount of waiting will ever produce a worker. Resolve
+    # it once, and only to ESCALATE severity — never to suppress the rule,
+    # so an unimportable profiles module cannot silently disable this.
+    unroutable = False
+    if assignee:
+        try:
+            from hermes_cli.profiles import profile_exists
+            unroutable = not profile_exists(assignee)
+        except Exception:
+            unroutable = False
+
+    if unroutable or age_seconds >= threshold_seconds * 6:
+        severity = "critical"
+    elif age_seconds >= threshold_seconds * 2:
+        severity = "error"
+    else:
+        severity = "warning"
+
+    if not assignee:
+        detail = (
+            f"This task has been in review for {age_str} with no reviewer "
+            f"assigned, so the review dispatcher will never spawn one. "
+            f"Assign a reviewer profile, or pass reviewer= on "
+            f"kanban_request_review."
+        )
+    elif unroutable:
+        detail = (
+            f"This task has been in review for {age_str} assigned to "
+            f"{assignee!r}, which is NOT an existing Hermes profile. The "
+            f"review dispatcher skips it as non-spawnable every tick, so "
+            f"the card can never be graded. Reassign it to a real profile "
+            f"(see `hermes profile list`)."
+        )
+    else:
+        detail = (
+            f"This task has been in review for {age_str} but no reviewer "
+            f"has claimed it. Confirm {assignee!r} is actually polling, "
+            f"that kanban.review_dispatch is enabled, and that the profile "
+            f"is not stuck at its per-profile concurrency cap."
+        )
+
+    actions = [
+        DiagnosticAction(
+            kind="reassign",
+            label="Reassign to a real reviewer profile",
+            payload={"current_assignee": assignee},
+        ),
+        DiagnosticAction(
+            kind="cli_hint",
+            label="List available profiles",
+            payload={"command": "hermes profile list"},
+        ),
+    ]
+
+    return [Diagnostic(
+        kind="stranded_in_review",
+        severity=severity,
+        title=(
+            f"In review {age_str} with an unroutable reviewer"
+            if unroutable else f"In review {age_str} with no reviewer"
+        ),
+        detail=detail,
+        actions=actions,
+        first_seen_at=last_review_ts,
+        last_seen_at=last_review_ts,
+        count=1,
+        data={
+            "review_since": last_review_ts,
+            "age_seconds": int(age_seconds),
+            "assignee": assignee,
+            "assignee_is_profile": (not unroutable) if assignee else False,
+            "threshold_seconds": int(threshold_seconds),
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1090,6 +1223,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_stranded_in_review,
 ]
 
 
@@ -1105,6 +1239,7 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "stranded_in_review",
 )
 
 

@@ -198,6 +198,102 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     assert stranded[0].data["assignee"] == "demo"
 
 
+# ---------------------------------------------------------------------------
+# stranded_in_review
+#
+# Regression cover for the live incident on 2026-08-22 (card t_1165020d):
+# request_review(reviewer="reviewer") wrote a non-existent profile onto
+# tasks.assignee, the review dispatcher skipped the rows as non-spawnable
+# every tick (a deliberately quiet bucket), and two finished healify cards
+# sat ungraded in 'review' for ~4h with no signal on any surface.
+# ---------------------------------------------------------------------------
+
+
+def test_stranded_in_review_is_critical_when_reviewer_is_not_a_profile(
+    monkeypatch,
+):
+    """The headline regression: an unroutable reviewer is critical
+    immediately, not after 6x the threshold, because no amount of waiting
+    can ever produce a worker for it."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
+    )
+    now = 100_000
+    task = _task(status="review", assignee="reviewer", claim_lock=None)
+    # 45 min: past the 30 min threshold but well under the 6x (3h) mark
+    # that would make a ROUTABLE reviewer critical on age alone.
+    events = [_event("review_requested", ts=now - 45 * 60)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_review"]
+    assert len(stranded) == 1
+    assert stranded[0].severity == "critical"
+    assert stranded[0].data["assignee"] == "reviewer"
+    assert stranded[0].data["assignee_is_profile"] is False
+    # The operator must be told WHY it can never be claimed.
+    assert "not an existing hermes profile" in stranded[0].detail.lower()
+
+
+def test_stranded_in_review_real_profile_is_only_a_warning(monkeypatch):
+    """A real reviewer profile that is merely slow is a warning at the
+    same age — this is what keeps the rule from crying wolf on a busy
+    but correctly-wired board."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
+    )
+    now = 100_000
+    task = _task(status="review", assignee="verifier", claim_lock=None)
+    events = [_event("review_requested", ts=now - 45 * 60)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_review"]
+    assert len(stranded) == 1
+    assert stranded[0].severity == "warning"
+    assert stranded[0].data["assignee_is_profile"] is True
+
+
+def test_stranded_in_review_silent_under_threshold_and_when_claimed(
+    monkeypatch,
+):
+    """No false positives: a fresh review, and a review under a live
+    reviewer claim, must both stay silent even with a bad assignee."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
+    )
+    now = 100_000
+    fresh = _task(status="review", assignee="reviewer", claim_lock=None)
+    diags = kd.compute_task_diagnostics(
+        fresh, [_event("review_requested", ts=now - 5 * 60)], [], now=now
+    )
+    assert [d for d in diags if d.kind == "stranded_in_review"] == []
+
+    claimed = _task(
+        status="review", assignee="reviewer", claim_lock="host:123"
+    )
+    diags = kd.compute_task_diagnostics(
+        claimed, [_event("review_requested", ts=now - 45 * 60)], [], now=now
+    )
+    assert [d for d in diags if d.kind == "stranded_in_review"] == []
+
+
+def test_stranded_in_review_ignores_non_review_status(monkeypatch):
+    """A ready task with the same stale timestamps belongs to
+    stranded_in_ready, not this rule. Guards against double-flagging."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
+    )
+    now = 100_000
+    task = _task(status="ready", assignee="reviewer", claim_lock=None)
+    events = [_event("review_requested", ts=now - 45 * 60)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert [d for d in diags if d.kind == "stranded_in_review"] == []
+
+
+def test_stranded_in_review_is_registered():
+    """The rule must be wired into the registry and the kind legend, or
+    it computes nothing and the UI cannot render it."""
+    assert kd._rule_stranded_in_review in kd._RULES
+    assert "stranded_in_review" in kd.DIAGNOSTIC_KINDS
+
+
 
 
 # ---------------------------------------------------------------------------
