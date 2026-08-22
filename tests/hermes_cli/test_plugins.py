@@ -158,6 +158,87 @@ class TestPluginDiscovery:
         assert RELAY_PLUGINS_CONFIG_ENV in state.error
         assert "Refusing to load removed Hermes Relay plugin" in caplog.text
 
+    # ── plugins.enabled entries with no manifest are never silent ──────────
+    #
+    # Regression for a live defect on this install: a profile listed four
+    # user guard plugins in ``plugins.enabled`` while its
+    # ``$HERMES_HOME/plugins/`` directory did not exist, so every
+    # pre_tool_call gate was inert while ``hermes config get plugins.enabled``
+    # read as if they were on. Discovery skipped them without a word. The
+    # contract asserted here is the RELATION: every enabled key that no
+    # discovered manifest matched must appear in a WARNING, and a key that
+    # WAS matched must not.
+
+    def test_enabled_plugin_with_no_manifest_warns(self, monkeypatch, caplog):
+        from hermes_cli import plugins as plugins_mod
+
+        present = PluginManifest(name="present-guard", key="present-guard", source="user")
+        manager = PluginManager()
+        monkeypatch.setattr(manager, "_collect_directory_manifests", lambda: [present])
+        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(
+            plugins_mod,
+            "_get_enabled_plugins",
+            lambda: {"present-guard", "ghost-guard", "other-ghost"},
+        )
+        monkeypatch.setattr(plugins_mod, "_get_disabled_plugins", lambda: set())
+        monkeypatch.setattr(manager, "_load_plugin", lambda m: None)
+
+        with caplog.at_level(logging.WARNING):
+            manager.discover_and_load()
+
+        warnings = "\n".join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        # Both unmatched keys are named...
+        assert "ghost-guard" in warnings
+        assert "other-ghost" in warnings
+        # ...the matched one is not reported as missing...
+        assert "present-guard" not in warnings
+        # ...and the message says the hooks are inert, not merely "skipped".
+        assert "inert" in warnings
+
+    def test_no_warning_when_every_enabled_plugin_was_discovered(
+        self, monkeypatch, caplog
+    ):
+        from hermes_cli import plugins as plugins_mod
+
+        present = PluginManifest(name="present-guard", key="present-guard", source="user")
+        manager = PluginManager()
+        monkeypatch.setattr(manager, "_collect_directory_manifests", lambda: [present])
+        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(
+            plugins_mod, "_get_enabled_plugins", lambda: {"present-guard"}
+        )
+        monkeypatch.setattr(plugins_mod, "_get_disabled_plugins", lambda: set())
+        monkeypatch.setattr(manager, "_load_plugin", lambda m: None)
+
+        with caplog.at_level(logging.WARNING):
+            manager.discover_and_load()
+
+        assert "plugins.enabled lists" not in caplog.text
+
+    def test_enabled_key_matching_manifest_name_is_not_reported_missing(
+        self, monkeypatch, caplog
+    ):
+        """A key may name the manifest rather than the path-derived key."""
+        from hermes_cli import plugins as plugins_mod
+
+        # key and name differ, as they do for nested plugins (image_gen/openai)
+        present = PluginManifest(name="openai", key="image_gen/openai", source="bundled")
+        manager = PluginManager()
+        monkeypatch.setattr(manager, "_collect_directory_manifests", lambda: [present])
+        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(plugins_mod, "_get_enabled_plugins", lambda: {"openai"})
+        monkeypatch.setattr(plugins_mod, "_get_disabled_plugins", lambda: set())
+        monkeypatch.setattr(manager, "_load_plugin", lambda m: None)
+
+        with caplog.at_level(logging.WARNING):
+            manager.discover_and_load()
+
+        assert "plugins.enabled lists" not in caplog.text
+
+
     def test_enabled_portable_plugin_registers_components(
         self, tmp_path, monkeypatch
     ):
