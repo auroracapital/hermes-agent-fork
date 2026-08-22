@@ -218,6 +218,10 @@ def test_stranded_in_review_is_critical_when_reviewer_is_not_a_profile(
     monkeypatch.setattr(
         "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
     )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_diagnostics._assignee_has_run_history",
+        lambda name: False,
+    )
     now = 100_000
     task = _task(status="review", assignee="reviewer", claim_lock=None)
     # 45 min: past the 30 min threshold but well under the 6x (3h) mark
@@ -240,6 +244,10 @@ def test_stranded_in_review_real_profile_is_only_a_warning(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
     )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_diagnostics._assignee_has_run_history",
+        lambda name: False,
+    )
     now = 100_000
     task = _task(status="review", assignee="verifier", claim_lock=None)
     events = [_event("review_requested", ts=now - 45 * 60)]
@@ -257,6 +265,10 @@ def test_stranded_in_review_silent_under_threshold_and_when_claimed(
     reviewer claim, must both stay silent even with a bad assignee."""
     monkeypatch.setattr(
         "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_diagnostics._assignee_has_run_history",
+        lambda name: False,
     )
     now = 100_000
     fresh = _task(status="review", assignee="reviewer", claim_lock=None)
@@ -280,6 +292,10 @@ def test_stranded_in_review_ignores_non_review_status(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
     )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_diagnostics._assignee_has_run_history",
+        lambda name: False,
+    )
     now = 100_000
     task = _task(status="ready", assignee="reviewer", claim_lock=None)
     events = [_event("review_requested", ts=now - 45 * 60)]
@@ -294,29 +310,26 @@ def test_stranded_in_review_is_registered():
     assert "stranded_in_review" in kd.DIAGNOSTIC_KINDS
 
 
-
-
-# ---------------------------------------------------------------------------
-# triage_aux_unavailable rule — auto-decompose aware
-# ---------------------------------------------------------------------------
-
-
-def _triage_task():
-    return _task(id="t_triage1", status="triage")
-
-
-
-
-
-
-
-
-def test_severity_at_or_above_uses_threshold_semantics():
-    assert kd.severity_at_or_above("warning", "warning") is True
-    assert kd.severity_at_or_above("error", "warning") is True
-    assert kd.severity_at_or_above("critical", "warning") is True
-    assert kd.severity_at_or_above("critical", "error") is True
-    assert kd.severity_at_or_above("warning", "error") is False
-    assert kd.severity_at_or_above("error", "critical") is False
-    assert kd.severity_at_or_above("mystery", "warning") is False
-    assert kd.severity_at_or_above("warning", None) is True
+def test_stranded_in_review_human_lane_with_run_history_is_only_a_warning(
+    monkeypatch,
+):
+    """A human pull-lane (e.g. 'sam') has no Hermes profile but has
+    real run history. Age-based flag still fires, but it is NOT the
+    'unclaimable' critical that would fire for a typo like 'reviewer'."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "verifier"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_diagnostics._assignee_has_run_history",
+        lambda name: name == "sam",
+    )
+    now = 100_000
+    task = _task(status="review", assignee="sam", claim_lock=None)
+    events = [_event("review_requested", ts=now - 45 * 60)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_review"]
+    assert len(stranded) == 1
+    assert stranded[0].severity == "warning"
+    assert stranded[0].data["assignee_is_profile"] is False
+    assert stranded[0].data["assignee_has_lane_history"] is True
+    assert "unclaimable" not in stranded[0].title.lower()

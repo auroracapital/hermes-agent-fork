@@ -30,8 +30,10 @@ Design goals:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 import json
+import os
 import time
 
 
@@ -1078,6 +1080,38 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _assignee_has_run_history(assignee: str) -> bool:
+    """True if this assignee has EVER produced a task_run on any board.
+
+    Discriminates a real human / external pull lane (which claims cards
+    via ``claim_task`` and legitimately has no Hermes profile) from a
+    typo'd assignee that nothing will ever claim. Measured rather than
+    curated, so no allowlist needs maintaining.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    root = Path(
+        os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    ) / "kanban" / "boards"
+    boards = []
+    if root.is_dir():
+        boards = [
+            d.name for d in root.iterdir() if (d / "kanban.db").is_file()
+        ]
+    for b in boards or [None]:
+        try:
+            conn = _kb.connect(board=b) if b else _kb.connect()
+            row = conn.execute(
+                "SELECT 1 FROM task_runs WHERE profile = ? LIMIT 1",
+                (assignee,),
+            ).fetchone()
+            if row is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _rule_stranded_in_review(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Flag a task parked in ``review`` that no reviewer ever claims.
 
@@ -1134,19 +1168,41 @@ def _rule_stranded_in_review(task, events, runs, now, cfg) -> list[Diagnostic]:
     else:
         age_str = f"{int(age_seconds / 60)}m"
 
-    # An unroutable assignee is a strictly worse condition than a slow
-    # reviewer: no amount of waiting will ever produce a worker. Resolve
-    # it once, and only to ESCALATE severity — never to suppress the rule,
-    # so an unimportable profiles module cannot silently disable this.
-    unroutable = False
+    # An assignee nothing can claim is strictly worse than a slow reviewer:
+    # no amount of waiting will ever produce a worker. But "not a Hermes
+    # profile" is NOT sufficient to conclude that — a human or external
+    # terminal lane (e.g. 'sam') legitimately pulls cards via claim_task
+    # and has no profile. Discriminate on measured behaviour: does this
+    # lane have ANY run history on this board? A real lane does; a typo
+    # has exactly zero. Live 2026-08-22: 'sam' had 37 runs and is a real
+    # pull lane, 'reviewer' had 0 and was a typo for 'verifier'.
+    #
+    # Resolved only to ESCALATE severity and sharpen the message, never to
+    # suppress the rule — a card nobody grades still deserves a flag, so an
+    # unimportable profiles module or an absent runs table cannot silently
+    # disable this.
+    is_profile = False
     if assignee:
         try:
             from hermes_cli.profiles import profile_exists
-            unroutable = not profile_exists(assignee)
+            is_profile = bool(profile_exists(assignee))
         except Exception:
-            unroutable = False
+            is_profile = False
 
-    if unroutable or age_seconds >= threshold_seconds * 6:
+    has_lane_history = False
+    if assignee and not is_profile:
+        try:
+            has_lane_history = _assignee_has_run_history(assignee)
+        except Exception:
+            # Unknown: assume it IS a real lane rather than accusing a
+            # human reviewer of being a typo.
+            has_lane_history = True
+
+    # Unclaimable == not a profile the dispatcher can spawn AND not a lane
+    # that has ever actually run anything.
+    unclaimable = bool(assignee) and not is_profile and not has_lane_history
+
+    if unclaimable or age_seconds >= threshold_seconds * 6:
         severity = "critical"
     elif age_seconds >= threshold_seconds * 2:
         severity = "error"
@@ -1160,13 +1216,14 @@ def _rule_stranded_in_review(task, events, runs, now, cfg) -> list[Diagnostic]:
             f"Assign a reviewer profile, or pass reviewer= on "
             f"kanban_request_review."
         )
-    elif unroutable:
+    elif unclaimable:
         detail = (
             f"This task has been in review for {age_str} assigned to "
-            f"{assignee!r}, which is NOT an existing Hermes profile. The "
-            f"review dispatcher skips it as non-spawnable every tick, so "
-            f"the card can never be graded. Reassign it to a real profile "
-            f"(see `hermes profile list`)."
+            f"{assignee!r}, which is NOT an existing Hermes profile and "
+            f"has never produced a run on any board. The review dispatcher "
+            f"skips it as non-spawnable every tick, so the card can never "
+            f"be graded. Reassign it to a real profile (see "
+            f"`hermes profile list`)."
         )
     else:
         detail = (
@@ -1193,8 +1250,8 @@ def _rule_stranded_in_review(task, events, runs, now, cfg) -> list[Diagnostic]:
         kind="stranded_in_review",
         severity=severity,
         title=(
-            f"In review {age_str} with an unroutable reviewer"
-            if unroutable else f"In review {age_str} with no reviewer"
+            f"In review {age_str} with an unclaimable reviewer"
+            if unclaimable else f"In review {age_str} with no reviewer"
         ),
         detail=detail,
         actions=actions,
@@ -1205,7 +1262,8 @@ def _rule_stranded_in_review(task, events, runs, now, cfg) -> list[Diagnostic]:
             "review_since": last_review_ts,
             "age_seconds": int(age_seconds),
             "assignee": assignee,
-            "assignee_is_profile": (not unroutable) if assignee else False,
+            "assignee_is_profile": is_profile,
+            "assignee_has_lane_history": has_lane_history,
             "threshold_seconds": int(threshold_seconds),
         },
     )]
