@@ -52,9 +52,24 @@ class TestGatewayLifecyclePattern:
             "  -l ai.hermes.gateway-hard-restart-no-photon-notice \\\n"
             "  -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh"
         ),
+        # Both tokens inside ONE command segment still match after the
+        # branch-D gap was narrowed to same-segment (no `;&|` spanning).
+        "kill -9 $(pgrep -f 'hermes.*gateway')",
     ])
     def test_launchctl_submit_bootstrap_commands(self, text):
         assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
+        # A kill of an OPAQUE pid chained with a mere READ of the gateway
+        # log: the hermes/gateway tokens live in a different command of the
+        # chain, so this is diagnostics, not a gateway kill. Previously a
+        # false positive because branch D's gap spanned `&&`/`;`/`|`.
+        "kill -USR1 12345 && sleep 2 && tail -5 ~/.hermes/logs/gateway.log",
+        "kill -TERM 4242; grep -c error ~/.hermes/logs/gateway.log",
+        "pkill -f stale-worker | tee ~/.hermes/logs/gateway-cleanup-hermes.txt",
+    ])
+    def test_kill_chained_with_gateway_log_read_not_matched(self, text):
+        assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
 
     def test_line_continuation_does_not_bridge_unrelated_lines(self):
         # A backslash-newline is only normalized when it's a real shell

@@ -76,9 +76,16 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # Branch C: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
-    # token orders because real reproductions show both.
-    r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # token orders because real reproductions show both. The gap excludes
+    # `;&|` in addition to newlines so the two anchors must belong to the
+    # SAME command segment: `kill -USR1 <pid> && tail ~/.hermes/logs/gateway.log`
+    # kills an unrelated PID and merely *reads* the gateway log in a later
+    # command of the chain — matching across separators blocked that as a
+    # false positive. Real kill shapes carry both tokens inside one segment
+    # (`pkill -f hermes.*gateway`, `kill -9 $(pgrep -f hermes-gateway)`)
+    # and still match.
+    r"|(?:p?kill\b[^\n;&|]*\bhermes\b[^\n;&|]*\bgateway)"
+    r"|(?:p?kill\b[^\n;&|]*\bgateway\b[^\n;&|]*\bhermes)"
 )
 
 
