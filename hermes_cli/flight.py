@@ -170,6 +170,16 @@ def _read_config(path: Path) -> dict[str, Any]:
     return data
 
 
+def _is_local_config(config: dict[str, Any]) -> bool:
+    return (config.get("model") or {}).get("provider") == LOCAL_PROVIDER
+
+
+def _is_degraded_restore(config: dict[str, Any], live: dict[str, Any]) -> bool:
+    if _is_local_config(config):
+        return True
+    return bool(live.get("fallback_providers")) and not config.get("fallback_providers")
+
+
 def _resolve_api_key(provider: dict[str, Any]) -> str:
     key_env = str(provider.get("key_env") or provider.get("api_key_env") or "").strip()
     if key_env:
@@ -412,9 +422,11 @@ class FlightManager:
             return False, "normal route missing base_url or model"
         return _probe_openai(base_url, model, api_key)
 
-    def _backup_profile(self, profile_home: Path) -> dict[str, Any]:
+    def _backup_profile(self, profile_home: Path) -> Optional[dict[str, Any]]:
         config_path = profile_home / "config.yaml"
         raw = config_path.read_bytes() if config_path.exists() else b""
+        if raw and _is_local_config(_read_config(config_path)):
+            return None
         backup_name = f"config-{len(list(_flight_dir(self.home).glob('config-*.yaml'))):03d}.yaml"
         backup_path = _flight_dir(self.home) / backup_name
         _atomic_write_bytes(backup_path, raw)
@@ -424,13 +436,86 @@ class FlightManager:
         homes = [self.home]
         profiles = self.home / "profiles"
         if profiles.is_dir():
-            homes.extend(sorted(path for path in profiles.iterdir() if path.is_dir()))
+            homes.extend(sorted(path for path in profiles.iterdir() if path.is_dir() and path.name != "offline"))
         return homes
+
+    def _clean_backup_for(
+        self,
+        item: dict[str, Any],
+        generation_size: int,
+    ) -> Optional[Path]:
+        config_path = Path(item["config"])
+        live = _read_config(config_path)
+        recorded = Path(item["backup"])
+        candidates = [recorded]
+        try:
+            recorded_index = int(recorded.stem.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            recorded_index = -1
+        if recorded_index >= 0 and generation_size:
+            generation_position = recorded_index % generation_size
+            for index in range(
+                recorded_index - generation_size,
+                generation_position - 1,
+                -generation_size,
+            ):
+                candidates.append(recorded.with_name(f"config-{index:03d}.yaml"))
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                config = yaml.safe_load(candidate.read_text()) or {}
+            except Exception:
+                continue
+            if isinstance(config, dict) and not _is_degraded_restore(config, live):
+                return candidate
+        return None
+
+    def _recover_restore_target(self) -> dict[str, Any]:
+        homes = [home for home in self._profile_homes() if (home / "config.yaml").exists()]
+        snapshots = sorted(_flight_dir(self.home).glob("config-*.yaml"))
+        if not homes or not snapshots or len(snapshots) % len(homes):
+            return {"profiles": [], "configs": []}
+        generation_size = len(homes)
+        configs = []
+        for position, profile_home in enumerate(homes):
+            matching = [
+                path
+                for path in snapshots
+                if int(path.stem.rsplit("-", 1)[1]) % generation_size == position
+            ]
+            if not matching:
+                continue
+            probe = {
+                "home": str(profile_home),
+                "config": str(profile_home / "config.yaml"),
+                "backup": str(matching[-1]),
+                "existed": True,
+            }
+            clean = self._clean_backup_for(probe, generation_size)
+            if clean is not None:
+                probe["backup"] = str(clean)
+                configs.append(probe)
+        return {"profiles": [item["home"] for item in configs], "configs": configs}
 
     def enter(self, *, now: Optional[float] = None, port_tasks: bool = True) -> dict[str, Any]:
         now = time.time() if now is None else now
         state = self._load_state(now)
         if state.get("mode") == "local":
+            return state
+        configs_on_disk = [
+            _read_config(home / "config.yaml")
+            for home in self._profile_homes()
+            if (home / "config.yaml").exists()
+        ]
+        if any(_is_local_config(config) for config in configs_on_disk):
+            if not (state.get("saved_restore_target") or {}).get("configs"):
+                state["saved_restore_target"] = self._recover_restore_target()
+            state["mode"] = "local"
+            state.setdefault("warnings", []).append(
+                "configs already use flight-local; refused to snapshot them as restore targets"
+            )
+            self._save_state(state)
             return state
         if self.local_model == DEFAULT_LOCAL_MODEL:
             ok, detail = ensure_local_model(self.local_model, base_url=self.local_base_url)
@@ -442,6 +527,8 @@ class FlightManager:
             if not config_path.exists():
                 continue
             target = self._backup_profile(profile_home)
+            if target is None:
+                continue
             local = build_local_config(
                 _read_config(config_path),
                 model=self.local_model,
@@ -492,10 +579,17 @@ class FlightManager:
         if state.get("mode") != "local":
             return state
         target = state.get("saved_restore_target") or {}
-        for item in target.get("configs") or []:
+        configs = target.get("configs") or []
+        generation_size = len(configs)
+        for item in configs:
             config_path = Path(item["config"])
-            backup_path = Path(item["backup"])
+            backup_path = self._clean_backup_for(item, generation_size)
             if item.get("existed"):
+                if backup_path is None:
+                    state.setdefault("warnings", []).append(
+                        f"config restore skipped for {config_path}: no clean snapshot"
+                    )
+                    continue
                 _atomic_write_bytes(config_path, backup_path.read_bytes())
             elif config_path.exists():
                 config_path.unlink()

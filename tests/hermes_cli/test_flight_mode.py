@@ -122,6 +122,124 @@ def test_enter_and_exit_restore_exact_config_bytes(tmp_path, monkeypatch):
     assert manager.status(probe=False)["mode"] == "online"
 
 
+def test_offline_profile_is_exempt_from_flight_config_rewrites(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(_normal_config(), sort_keys=False))
+    offline_home = tmp_path / "profiles" / "offline"
+    offline_home.mkdir(parents=True)
+    offline_config = {
+        "model": {"provider": flight.LOCAL_PROVIDER, "default": "offline-model"},
+        "fallback_providers": [],
+    }
+    offline_path = offline_home / "config.yaml"
+    original = yaml.safe_dump(offline_config, sort_keys=False)
+    offline_path.write_text(original)
+
+    manager = flight.FlightManager(
+        home=tmp_path,
+        local_model="local-test-model",
+        probe=lambda *_args, **_kwargs: (True, "ok"),
+    )
+    state = manager.enter(now=10.0, port_tasks=False)
+
+    assert state["saved_restore_target"]["profiles"] == [str(tmp_path)]
+    assert offline_path.read_text() == original
+
+
+def test_second_enter_does_not_poison_restore_target_with_local_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    original_config = _normal_config()
+    config_path.write_text(yaml.safe_dump(original_config, sort_keys=False))
+
+    manager = flight.FlightManager(
+        home=tmp_path,
+        local_model="local-test-model",
+        probe=lambda *_args, **_kwargs: (True, "ok"),
+    )
+    first = manager.enter(now=10.0, port_tasks=False)
+    clean_backup = first["saved_restore_target"]["configs"][0]["backup"]
+
+    # Simulate a lost/reset state file while the on-disk config is still local.
+    manager._save_state(flight.new_state(now=15.0))
+    second = manager.enter(now=20.0, port_tasks=False)
+
+    assert second["mode"] == "local"
+    assert second["saved_restore_target"]["configs"][0]["backup"] == clean_backup
+    assert len(list((tmp_path / "flight-mode").glob("config-*.yaml"))) == 1
+
+    manager.exit(now=30.0)
+    restored = yaml.safe_load(config_path.read_text())
+    assert restored["model"]["provider"] == "cliproxyapi"
+    assert restored["fallback_providers"] == original_config["fallback_providers"]
+
+
+def test_exit_rejects_degraded_recorded_backup_and_uses_newest_clean_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    original_config = _normal_config()
+    config_path.write_text(yaml.safe_dump(original_config, sort_keys=False))
+
+    manager = flight.FlightManager(
+        home=tmp_path,
+        local_model="local-test-model",
+        probe=lambda *_args, **_kwargs: (True, "ok"),
+    )
+    state = manager.enter(now=10.0, port_tasks=False)
+    clean_backup = Path(state["saved_restore_target"]["configs"][0]["backup"])
+    poisoned_backup = clean_backup.with_name("config-001.yaml")
+    poisoned_backup.write_text(config_path.read_text())
+    state["saved_restore_target"]["configs"][0]["backup"] = str(poisoned_backup)
+    manager._save_state(state)
+
+    manager.exit(now=20.0)
+
+    restored = yaml.safe_load(config_path.read_text())
+    assert restored["model"]["provider"] == "cliproxyapi"
+    assert restored["fallback_providers"] == original_config["fallback_providers"]
+
+
+def test_exit_falls_back_from_empty_chain_backup_to_newest_clean_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    live_config = _normal_config()
+    config_path.write_text(yaml.safe_dump(live_config, sort_keys=False))
+    flight_dir = tmp_path / "flight-mode"
+    flight_dir.mkdir(parents=True)
+    clean_backup = flight_dir / "config-000.yaml"
+    clean_backup.write_text(yaml.safe_dump(live_config, sort_keys=False))
+    degraded_backup = flight_dir / "config-001.yaml"
+    degraded = dict(live_config)
+    degraded["fallback_providers"] = []
+    degraded_backup.write_text(yaml.safe_dump(degraded, sort_keys=False))
+
+    manager = flight.FlightManager(home=tmp_path, local_model="local-test-model")
+    state = flight.new_state(now=1.0)
+    state.update(
+        {
+            "mode": "local",
+            "saved_restore_target": {
+                "profiles": [str(tmp_path)],
+                "configs": [
+                    {
+                        "home": str(tmp_path),
+                        "config": str(config_path),
+                        "backup": str(degraded_backup),
+                        "existed": True,
+                    }
+                ],
+            },
+        }
+    )
+    manager._save_state(state)
+
+    manager.exit(now=2.0)
+
+    restored = yaml.safe_load(config_path.read_text())
+    assert restored["model"]["provider"] == "cliproxyapi"
+    assert restored["fallback_providers"] == live_config["fallback_providers"]
+
+
 def test_tick_transitions_online_local_online_using_real_inference_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(_normal_config(), sort_keys=False))
