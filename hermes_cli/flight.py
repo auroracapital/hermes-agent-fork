@@ -164,7 +164,7 @@ def build_local_config(
 def _read_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    data = yaml.safe_load(path.read_text()) or {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a YAML mapping")
     return data
@@ -270,7 +270,7 @@ def ensure_local_model(
     import subprocess
     import tempfile
 
-    with tempfile.NamedTemporaryFile("w", suffix=".modelfile", delete=False) as handle:
+    with tempfile.NamedTemporaryFile("w", suffix=".modelfile", delete=False, encoding="utf-8") as handle:
         handle.write(f"FROM {base}\nPARAMETER num_ctx 65536\n")
         path = handle.name
     try:
@@ -399,7 +399,7 @@ class FlightManager:
         path = _state_path(self.home)
         if path.exists():
             try:
-                state = json.loads(path.read_text())
+                state = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(state, dict):
                     return state
             except Exception:
@@ -464,7 +464,7 @@ class FlightManager:
             if not candidate.exists():
                 continue
             try:
-                config = yaml.safe_load(candidate.read_text()) or {}
+                config = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
             except Exception:
                 continue
             if isinstance(config, dict) and not _is_degraded_restore(config, live):
@@ -623,7 +623,7 @@ class FlightManager:
             target = state.get("saved_restore_target") or {}
             configs = target.get("configs") or []
             if state.get("mode") == "local" and configs:
-                raw = Path(configs[0]["backup"]).read_text()
+                raw = Path(configs[0]["backup"]).read_text(encoding="utf-8")
                 normal_config = yaml.safe_load(raw) or {}
             else:
                 normal_config = _read_config(self.home / "config.yaml")
@@ -641,7 +641,7 @@ class FlightManager:
         normal_config: dict[str, Any]
         configs = ((state.get("saved_restore_target") or {}).get("configs") or [])
         if state.get("mode") == "local" and configs:
-            normal_config = yaml.safe_load(Path(configs[0]["backup"]).read_text()) or {}
+            normal_config = yaml.safe_load(Path(configs[0]["backup"]).read_text(encoding="utf-8")) or {}
         else:
             normal_config = _read_config(self.home / "config.yaml")
         normal_ok, normal_detail = self.probe("normal", normal_config)
