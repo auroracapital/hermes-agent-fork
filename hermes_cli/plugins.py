@@ -4035,6 +4035,65 @@ class PluginManager:
                 sum(1 for p in self._plugins.values() if p.enabled),
             )
 
+        # An entry in ``plugins.enabled`` that matched NO discovered manifest
+        # is a silent no-op: the operator asked for a plugin, discovery never
+        # saw it, and nothing said so. Measured on this install — a profile
+        # listed four user guard plugins in ``plugins.enabled`` while its
+        # ``$HERMES_HOME/plugins/`` directory did not exist at all, so every
+        # one of those pre_tool_call gates was inert while the config read as
+        # if they were on. User plugins are per-home (``$HERMES_HOME/plugins``),
+        # so copying a profile's config without copying its plugins reproduces
+        # this every time.
+        #
+        # Warn once per discovery with the exact unmatched keys. Deliberately
+        # NOT an error: an allow-list entry for a plugin installed on another
+        # machine / another profile of a shared config is legitimate, and
+        # failing discovery over it would break that setup.
+        self._warn_enabled_but_undiscovered(enabled, winners.values())
+
+    def _warn_enabled_but_undiscovered(self, enabled, manifests) -> None:
+        """Log the ``plugins.enabled`` entries no DISCOVERED manifest matched.
+
+        ``enabled`` is the allow-list from :func:`_get_enabled_plugins`
+        (``None``/empty means "opt-in default, nothing enabled" — nothing to
+        warn about). ``manifests`` is the deduped set discovery actually found.
+
+        Matching is against the discovered manifests, NOT against
+        ``self._plugins``: a plugin can be found and then legitimately not
+        loaded (explicitly disabled, load error, removed-Relay refusal), and
+        those cases already report themselves. The condition this warns about
+        is strictly "the operator named something discovery never saw at all".
+        A key counts as matched when it equals a manifest's registry key OR its
+        name, mirroring the ``lookup_key in enabled or manifest.name in
+        enabled`` gate discovery itself applies. Legacy Relay keys are excluded
+        because they already warn separately.
+        """
+        if not enabled:
+            return
+        seen: set = set()
+        for manifest in manifests:
+            key = getattr(manifest, "key", None)
+            name = getattr(manifest, "name", None)
+            if key:
+                seen.add(key)
+            if name:
+                seen.add(name)
+        missing = sorted(
+            k
+            for k in enabled
+            if k not in seen and k not in LEGACY_RELAY_PLUGIN_KEYS
+        )
+        if not missing:
+            return
+        logger.warning(
+            "plugins.enabled lists %d plugin(s) no manifest was found for: %s. "
+            "They are NOT loaded and their hooks are inert. User plugins are "
+            "per-profile — install them under $HERMES_HOME/plugins/ or remove "
+            "the entries from plugins.enabled.",
+            len(missing),
+            ", ".join(missing),
+        )
+
     def register_approval_transport(
         self,
         name: str,
