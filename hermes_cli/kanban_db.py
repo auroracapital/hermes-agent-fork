@@ -6586,6 +6586,37 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        # Non-silent contract for an unroutable reviewer. ``reviewer`` is
+        # free text: it is normalized and written straight onto
+        # ``tasks.assignee``. When it does not name a real Hermes profile
+        # the review dispatch loop buckets the row into
+        # ``skipped_nonspawnable`` (deliberately quiet, so human-pulled
+        # control-plane lanes don't spam the operator) and the card is
+        # parked in ``review`` with no worker that can ever claim it.
+        # Observed live 2026-08-22: two cards sat 4h on ``reviewer``,
+        # which is not a profile on that install (the grader is
+        # ``verifier``). We do NOT refuse the transition — external
+        # reviewer lanes and human pull-based reviewers are legitimate and
+        # have no Hermes profile — but the operator gets one WARNING
+        # naming the value and the consequence, plus the durable
+        # ``stranded_in_review`` diagnostic if nothing claims it.
+        if reviewer:
+            try:
+                from hermes_cli.profiles import profile_exists
+                if not profile_exists(reviewer):
+                    _log.warning(
+                        "kanban request_review(%s): reviewer %r is not an "
+                        "existing Hermes profile; the review dispatcher "
+                        "cannot spawn a worker for it. The task will sit in "
+                        "'review' until a human or an external lane claims "
+                        "it. Use `hermes profile list` to see valid "
+                        "profiles.",
+                        task_id, reviewer,
+                    )
+            except Exception:
+                # Profiles module unavailable (test stubs, exotic envs) —
+                # never let the advisory check break the transition.
+                pass
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
