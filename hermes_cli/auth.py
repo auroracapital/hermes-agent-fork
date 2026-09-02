@@ -743,8 +743,8 @@ ZAI_ENDPOINTS = [
     # (id, base_url, probe_models, label)
     ("global",        "https://api.z.ai/api/paas/v4",        ["glm-5"],   "Global"),
     ("cn",            "https://open.bigmodel.cn/api/paas/v4", ["glm-5"],   "China"),
-    ("coding-global", "https://api.z.ai/api/coding/paas/v4",  ["glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "Global (Coding Plan)"),
-    ("coding-cn",     "https://open.bigmodel.cn/api/coding/paas/v4", ["glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "China (Coding Plan)"),
+    ("coding-global", "https://api.z.ai/api/coding/paas/v4",  ["glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "Global (Coding Plan)"),
+    ("coding-cn",     "https://open.bigmodel.cn/api/coding/paas/v4", ["glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "China (Coding Plan)"),
 ]
 
 
@@ -7096,6 +7096,25 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "api_key":
         return {"configured": False}
 
+    # Keyless providers (opencode-free) are served anonymously: no credential
+    # exists, so every install counts as configured/logged in. Derived from
+    # the HermesOverlay keyless flag — the same source the provider catalog
+    # and GUI contract tests use.
+    try:
+        from hermes_cli.providers import HERMES_OVERLAYS
+        _overlay = HERMES_OVERLAYS.get(provider_id)
+    except Exception:
+        _overlay = None
+    if _overlay is not None and getattr(_overlay, "keyless", False):
+        return {
+            "configured": True,
+            "provider": provider_id,
+            "name": pconfig.name,
+            "key_source": "keyless",
+            "base_url": pconfig.inference_base_url,
+            "logged_in": True,
+        }
+
     api_key = ""
     key_source = ""
     api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
@@ -7674,16 +7693,22 @@ def _prompt_model_selection(
                     if sale is not None:
                         any_on_sale = True
                         pct, was_prompt_raw, was_out_raw = sale
-                        was_inp = (
-                            _format_price_per_mtok(was_prompt_raw)
-                            if was_prompt_raw != ""
-                            else "?"
-                        )
-                        was_out = (
-                            _format_price_per_mtok(was_out_raw)
-                            if was_out_raw != ""
-                            else "?"
-                        )
+                        # Natively-free models (no gateway original) carry
+                        # empty was_* raws — leave them empty so the row
+                        # shows bare "-100%" with no "was ?/?" suffix.
+                        if was_prompt_raw == "" and was_out_raw == "":
+                            was_inp = was_out = ""
+                        else:
+                            was_inp = (
+                                _format_price_per_mtok(was_prompt_raw)
+                                if was_prompt_raw != ""
+                                else "?"
+                            )
+                            was_out = (
+                                _format_price_per_mtok(was_out_raw)
+                                if was_out_raw != ""
+                                else "?"
+                            )
             else:
                 inp, out, cache = "", "", ""
             _price_cache[mid] = (inp, out, cache, pct, was_inp, was_out)
@@ -7720,7 +7745,8 @@ def _prompt_model_selection(
         segs = [*name_segs, (price_part, None)]
         if on_sale:
             segs.append((f"  -{pct}%", "yellow"))
-            segs.append((f"  was {was_inp}/{was_out}", "dim"))
+            if was_inp or was_out:
+                segs.append((f"  was {was_inp}/{was_out}", "dim"))
         if mid == current_model:
             segs.append(("  ← currently in use", None))
         return segs
