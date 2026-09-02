@@ -64,6 +64,23 @@ FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 
+
+def _parse_env_int(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back on junk."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+    return value if value > 0 else default
+
+
+# Hard cap on a single process(action="wait") call, mirroring the terminal tool's
+# FOREGROUND_MAX_TIMEOUT. These are deliberately separate ceilings: TERMINAL_TIMEOUT
+# is how long a FOREGROUND command may block, and using it as the wait cap too meant
+# a background job could never be awaited longer than a foreground one — defeating
+# the point of background execution. Override via PROCESS_WAIT_MAX_TIMEOUT.
+PROCESS_WAIT_MAX_TIMEOUT = _parse_env_int("PROCESS_WAIT_MAX_TIMEOUT", 600)
+
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
 # Any match arriving inside that cooldown window is dropped and counted as a strike.
@@ -1950,7 +1967,8 @@ class ProcessRegistry:
 
         Args:
             session_id: The process to wait for.
-            timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config.
+            timeout: Max seconds to block. Defaults to TERMINAL_TIMEOUT, capped
+                at PROCESS_WAIT_MAX_TIMEOUT.
 
         Returns:
             dict with status ("exited", "timeout", "interrupted", "not_found")
@@ -1963,7 +1981,23 @@ class ProcessRegistry:
             default_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
         except (ValueError, TypeError):
             default_timeout = 180
-        max_timeout = default_timeout
+        # The ceiling is NOT the foreground default. Reusing TERMINAL_TIMEOUT as
+        # the max made the wait cap collapse onto the foreground default, so a
+        # background job could never be awaited longer than a foreground command
+        # may run — which is the entire reason background exists. A suite taking
+        # 313s could not be watched to completion in one call at the 180s default,
+        # and each clamp surfaced as status="timeout" on a healthy run. Foreground
+        # already has its own explicit, env-overridable cap (FOREGROUND_MAX_TIMEOUT,
+        # 600); PROCESS_WAIT_MAX_TIMEOUT mirrors that for the wait path.
+        #
+        # An EXPLICIT TERMINAL_TIMEOUT still wins in both directions: an operator
+        # who sets it deliberately (up or down) keeps that ceiling. Only the
+        # unset/default case is lifted to the wait cap, so this widens nothing
+        # that was deliberately configured.
+        if os.getenv("TERMINAL_TIMEOUT") is not None:
+            max_timeout = default_timeout
+        else:
+            max_timeout = PROCESS_WAIT_MAX_TIMEOUT
         requested_timeout = timeout
         timeout_note = None
 
@@ -3026,7 +3060,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": f"Max seconds to block for 'wait' action (max: {PROCESS_WAIT_MAX_TIMEOUT}). Returns partial output on timeout — a 'timeout' status means the wait window elapsed, NOT that the process failed; it keeps running and can be waited on again.",
                 "minimum": 1
             },
             "offset": {
