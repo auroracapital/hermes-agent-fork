@@ -247,6 +247,10 @@ chats decide who replies: [Bot Mode: A Roster of Agents](./bot-mode.md).
 
 The app checks for updates in the background and offers a one-click update when one is ready.
 
+The desktop app and the Hermes backend it talks to update on separate clocks — the app package on your machine, the backend wherever it runs. When more than one update target exists (a remote gateway, or several registered gateways), the update affordances (**Update now** on the About panel, the ⌘K **Update Hermes** row, and the update-ready toast) update **everything**: the connected backend first, then every other eligible registered gateway (Hermes Cloud entries are platform-managed and skipped), and the desktop app itself last, since applying the client update relaunches the app. Single-machine installs keep the one-button experience.
+
+After any backend update, the app also re-checks its own version and warns with a one-click **Update desktop app** action if the GUI is still behind — so updating a remote backend can never silently leave you on a stale desktop build.
+
 The [manual update process](https://hermes-agent.nousresearch.com/docs/getting-started/updating) also works with the GUI.
 
 ## Uninstalling
@@ -405,6 +409,37 @@ another profile's agent plugins without switching the whole app (the backend
 
 ## Troubleshooting
 
+### Failed turns name the failing layer
+
+When a turn fails, the chat renders an error card that names **which layer
+failed** — provider/model, custom endpoint, streaming connection,
+authentication, billing, gateway, local runtime, or disk — instead of a
+generic error toast. The card offers recovery actions matched to the failure:
+
+- **Retry** — re-runs the failed turn in place (hidden when retrying would
+  deterministically reproduce the failure, e.g. a content-policy rejection).
+- **Switch provider** — jumps to Settings → Models for provider, endpoint,
+  auth, and billing failures.
+- **Open logs** — opens `HERMES_HOME/logs` in your file manager. On a remote
+  or Cloud connection the button reads **Open Desktop logs**: it opens the
+  local Desktop-side logs (transport evidence), since the failed turn's
+  gateway/agent logs live on the remote machine.
+- **Send diagnostics** — uploads a redacted debug bundle to Nous-internal
+  storage after an explicit consent prompt (same pipeline as
+  `hermes debug share --nous`; secrets are always redacted, the bundle is
+  viewable by Nous staff only and auto-deletes after 14 days). On success you
+  get a private view link to paste into your support thread, plus quick links
+  to GitHub Issues, Nous Portal Support, and Discord. On a remote or Cloud
+  connection the backend bundles its own agent/gateway logs and the local
+  Desktop log is attached alongside, so support sees both halves.
+- **Copy error details** — copies a compact plain-text summary (layer, code,
+  provider/model, error message) you can paste into a bug report or Discord.
+
+The layer comes from the same error classifier the agent's retry loop uses,
+so it reflects the real failure semantics, not a guess from the message text.
+Older backends that predate the descriptor still render the card with a
+generic title and the Retry / Open logs / Copy error details actions.
+
 Boot logs land in `HERMES_HOME/logs/desktop.log` (it includes backend output and recent Python tracebacks) — check it first if the app reports a boot failure. You can also tail it from the CLI:
 
 ```bash
@@ -423,6 +458,20 @@ rm -rf "$HOME/.hermes/hermes-agent/venv"
 # Reset a stuck macOS microphone prompt
 tccutil reset Microphone com.nousresearch.hermes
 ```
+
+### "The host key has CHANGED since you last connected" (SSH remote)
+
+If your SSH remote was reinstalled or its host key rotated, SSH fails closed
+and Desktop latches an error overlay instead of retrying (retrying can never
+succeed until the stale key is cleared). Verify the change is expected, then
+remove the old entry and retry from the overlay:
+
+```bash
+ssh-keygen -R <host>
+```
+
+Click **Retry** (or re-apply the connection in Settings → Gateway) after
+clearing the entry — the latch resets and the next boot dials fresh.
 
 ### "Build desktop app" stuck on Electron download
 
